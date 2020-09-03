@@ -1,4 +1,4 @@
-# Copyright 2017 Istio Authors
+# Copyright Istio Authors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -16,6 +16,11 @@
 # httpbin service
 ##################################################################################################
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: httpbin
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: httpbin
@@ -25,23 +30,30 @@ spec:
   ports:
   - name: http
     port: 8000
+    targetPort: 80
   selector:
     app: httpbin
 ---
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: httpbin
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      app: httpbin
+      version: v1
   template:
     metadata:
       labels:
         app: httpbin
+        version: v1
     spec:
+      serviceAccountName: httpbin
       containers:
-      - image: docker.io/citizenstig/httpbin
+      - image: docker.io/kennethreitz/httpbin
         imagePullPolicy: IfNotPresent
         name: httpbin
         ports:
-        - containerPort: 8000
+        - containerPort: 80

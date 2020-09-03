@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Copyright 2017 Istio Authors
+# Copyright Istio Authors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,4 +14,4 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-while true; do curl -s -o /dev/null http://$HELLOWORLD_URL/hello; done
+while true; do curl -s -o /dev/null "http://$GATEWAY_URL/hello"; done

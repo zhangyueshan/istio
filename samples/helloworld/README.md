@@ -1,41 +1,64 @@
 # Helloworld service
 
-This sample runs two versions of a simple helloworld service that return their version and instance (hostname)
-when called. It's used to demonstrate canary deployments working in conjunction with autoscaling.
-See [Canary deployments using istio](https://istio.io/blog/canary-deployments-using-istio.html).
+This sample includes two versions of a simple helloworld service that returns its version
+and instance (hostname) when called.
+It can be used as a test service when experimenting with version routing.
 
-## Start the services
+This service is also used to demonstrate canary deployments working in conjunction with autoscaling.
+See [Canary deployments using Istio](https://istio.io/blog/2017/0.1-canary.html).
 
-Note that kubernetes horizontal pod autosclalers only work if every container in the pods requests
-cpu. Since the Istio proxy container added by kube-inject does not currently do it, we
-need to edit the yaml before creating the deployment.
+## Start the helloworld service
 
-```bash
-istioctl kube-inject -f helloworld.yaml -o helloworld-istio.yaml
-```
-Edit `helloworld-istio.yaml` to add the following to the proxy container
-definition in both of the Deployment templates (helloworld-v1 and helloworld-v2)
+The following commands assume you have
+[automatic sidecar injection](https://istio.io/docs/setup/additional-setup/sidecar-injection/#automatic-sidecar-injection)
+enabled in your cluster.
+If not, you'll need to modify them to include
+[manual sidecar injection](https://istio.io/docs/setup/additional-setup/sidecar-injection/#manual-sidecar-injection).
 
-```yaml
-        resources:
-          requests:
-            cpu: 100m
-```
-
-Now create the deployment using the updated yaml file.
+To run both versions of the helloworld service, use the following command:
 
 ```bash
-kubectl create -f helloworld-istio.yaml
+kubectl apply -f helloworld.yaml
 ```
 
-Get the ingress URL and confirm it's running using curl.
+Alternatively, you can run just one version at a time by first defining the service:
 
 ```bash
-export HELLOWORLD_URL=$(kubectl get po -l istio=ingress -o 'jsonpath={.items[0].status.hostIP}'):$(kubectl get svc istio-ingress -o 'jsonpath={.spec.ports[0].nodePort}')
-curl http://$HELLOWORLD_URL/hello
+kubectl apply -f helloworld.yaml -l app=helloworld
+```
+
+and then deploying version v1, v2, or both:
+
+```bash
+kubectl apply -f helloworld.yaml -l version=v1
+kubectl apply -f helloworld.yaml -l version=v2
+```
+
+## Configure the helloworld gateway
+
+Apply the helloworld gateway configuration:
+
+```bash
+kubectl apply -f helloworld-gateway.yaml
+```
+
+Follow [these instructions](https://istio.io/docs/tasks/traffic-management/ingress/ingress-control/#determining-the-ingress-ip-and-ports)
+to set the INGRESS_HOST and INGRESS_PORT variables and then confirm the sample is running using curl:
+
+```bash
+export GATEWAY_URL=$INGRESS_HOST:$INGRESS_PORT
+curl http://$GATEWAY_URL/hello
 ```
 
 ## Autoscale the services
+
+Note that a Kubernetes [Horizontal Pod Autoscaler](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/)
+only works if all containers in the pods request cpu. In this sample the deployment
+containers in `helloworld.yaml` are configured with the request.
+The injected istio-proxy containers also include cpu requests,
+making the helloworld service ready for autoscaling.
+
+Enable autoscaling on both versions of the service:
 
 ```bash
 kubectl autoscale deployment helloworld-v1 --cpu-percent=50 --min=1 --max=10
@@ -50,9 +73,18 @@ kubectl get hpa
 ./loadgen.sh & # run it twice to generate lots of load
 ```
 
+Wait for about 2 minutes and then check the number of replicas:
+
+```bash
+kubectl get hpa
+```
+
+If the autoscaler is functioning correctly, the `REPLICAS` column should have a value > 1.
+
 ## Cleanup
 
 ```bash
 kubectl delete -f helloworld.yaml
-kubectl delete hpa --all
+kubectl delete -f helloworld-gateway.yaml
+kubectl delete hpa helloworld-v1 helloworld-v2
 ```

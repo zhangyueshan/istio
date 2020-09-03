@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@
 package util
 
 import (
+	"context"
 	"time"
 
-	"github.com/golang/glog"
+	"istio.io/pkg/log"
 )
 
 const (
@@ -30,7 +31,7 @@ const (
 func Backoff(baseDelay, maxDelay time.Duration, retries int) time.Duration {
 	backoff, max := float64(baseDelay), float64(maxDelay)
 	for backoff < max && retries > 0 {
-		backoff = backoff * backoffFactor
+		backoff *= backoffFactor
 		retries--
 	}
 	if backoff > max {
@@ -49,6 +50,8 @@ type Retrier struct {
 	BaseDelay time.Duration
 	// MaxDelay is the maximum delay allowed between retry attempts.
 	MaxDelay time.Duration
+	// MaxDuration is the maximum cumulative duration allowed for all retries
+	MaxDuration time.Duration
 	// Retries defines number of retry attempts
 	Retries int
 }
@@ -63,23 +66,36 @@ func (e Break) Error() string {
 }
 
 // Retry calls the given function a number of times, unless it returns a nil or a Break
-func (r Retrier) Retry(fn func(retryIndex int) error) (int, error) {
+func (r Retrier) Retry(ctx context.Context, fn func(ctx context.Context, retryIndex int) error) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if r.MaxDuration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.MaxDuration)
+		defer cancel()
+	}
+
 	var err error
 	var i int
 	if r.Retries <= 0 {
-		glog.Warningf("retries must to be >= 1. Got %d, setting to 1", r.Retries)
+		log.Warnf("retries must to be >= 1. Got %d, setting to 1", r.Retries)
 		r.Retries = 1
 	}
 	for i = 1; i <= r.Retries; i++ {
-		err = fn(i)
+		err = fn(ctx, i)
 		if err == nil {
 			return i, nil
 		}
 		if be, ok := err.(Break); ok {
 			return i, be.Err
 		}
-		backoff := Backoff(r.BaseDelay, r.MaxDelay, i)
-		time.Sleep(backoff)
+
+		select {
+		case <-ctx.Done():
+			return i - 1, ctx.Err()
+		case <-time.After(Backoff(r.BaseDelay, r.MaxDelay, i)):
+		}
 	}
 	return i - 1, err
 }

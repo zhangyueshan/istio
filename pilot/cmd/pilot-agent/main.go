@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,271 +18,503 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"net/http"
+	"net"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
-	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/duration"
+	"github.com/gogo/protobuf/types"
 	"github.com/spf13/cobra"
+	"github.com/spf13/cobra/doc"
+	"google.golang.org/grpc/grpclog"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
-	"istio.io/istio/pilot/cmd"
-	"istio.io/istio/pilot/model"
-	"istio.io/istio/pilot/platform"
-	"istio.io/istio/pilot/proxy"
-	"istio.io/istio/pilot/proxy/envoy"
-	"istio.io/istio/pilot/tools/version"
+	"istio.io/istio/pilot/cmd/pilot-agent/status"
+	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/model"
+	securityModel "istio.io/istio/pilot/pkg/security/model"
+	"istio.io/istio/pilot/pkg/serviceregistry"
+	"istio.io/istio/pilot/pkg/util/network"
+	"istio.io/istio/pkg/cmd"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/envoy"
+	istio_agent "istio.io/istio/pkg/istio-agent"
+	"istio.io/istio/pkg/jwt"
+	"istio.io/istio/pkg/security"
+	"istio.io/istio/pkg/util/gogoprotomarshal"
+	"istio.io/istio/security/pkg/credentialfetcher"
+	stsserver "istio.io/istio/security/pkg/stsservice/server"
+	"istio.io/istio/security/pkg/stsservice/tokenmanager"
+	cleaniptables "istio.io/istio/tools/istio-clean-iptables/pkg/cmd"
+	iptables "istio.io/istio/tools/istio-iptables/pkg/cmd"
+	"istio.io/pkg/collateral"
+	"istio.io/pkg/env"
+	"istio.io/pkg/log"
+	"istio.io/pkg/version"
 )
 
+const (
+	trustworthyJWTPath = "./var/run/secrets/tokens/istio-token"
+	localHostIPv4      = "127.0.0.1"
+	localHostIPv6      = "[::1]"
+)
+
+// TODO: Move most of this to pkg.
+
 var (
-	role            proxy.Node
-	serviceregistry platform.ServiceRegistry
+	role               = &model.Proxy{}
+	proxyIP            string
+	registryID         serviceregistry.ProviderID
+	trustDomain        string
+	stsPort            int
+	tokenManagerPlugin string
+
+	meshConfigFile string
 
 	// proxy config flags (named identically)
-	configPath             string
-	binaryPath             string
 	serviceCluster         string
-	availabilityZone       string
-	drainDuration          time.Duration
-	parentShutdownDuration time.Duration
-	discoveryAddress       string
-	discoveryRefreshDelay  time.Duration
-	zipkinAddress          string
-	connectTimeout         time.Duration
-	statsdUDPAddress       string
-	proxyAdminPort         int
-	controlPlaneAuthPolicy string
-	customConfigFile       string
 	proxyLogLevel          string
+	proxyComponentLogLevel string
+	concurrency            int
+	templateFile           string
+	loggingOptions         = log.DefaultOptions()
+	outlierLogPath         string
+
+	instanceIPVar        = env.RegisterStringVar("INSTANCE_IP", "", "")
+	podNameVar           = env.RegisterStringVar("POD_NAME", "", "")
+	podNamespaceVar      = env.RegisterStringVar("POD_NAMESPACE", "", "")
+	kubeAppProberNameVar = env.RegisterStringVar(status.KubeAppProberEnvName, "", "")
+	clusterIDVar         = env.RegisterStringVar("ISTIO_META_CLUSTER_ID", "", "")
+	callCredentials      = env.RegisterBoolVar("CALL_CREDENTIALS", false, "Use JWT directly instead of MTLS")
+
+	pilotCertProvider = env.RegisterStringVar("PILOT_CERT_PROVIDER", "istiod",
+		"The provider of Pilot DNS certificate.").Get()
+	jwtPolicy = env.RegisterStringVar("JWT_POLICY", jwt.PolicyThirdParty,
+		"The JWT validation policy.")
+	// ProvCert is the environment controlling the use of pre-provisioned certs, for VMs.
+	// May also be used in K8S to use a Secret to bootstrap (as a 'refresh key'), but use short-lived tokens
+	// with extra SAN (labels, etc) in data path.
+	provCert = env.RegisterStringVar("PROV_CERT", "",
+		"Set to a directory containing provisioned certs, for VMs").Get()
+
+	// set to "/etc/ssl/certs/ca-certificates.crt" on debian/ubuntu for ACME/public signed XDS servers.
+	xdsRootCA = env.RegisterStringVar("XDS_ROOT_CA", "",
+		"Explicitly set the root CA to expect for the XDS connection.").Get()
+
+	// set to "/etc/ssl/certs/ca-certificates.crt" on debian/ubuntu for ACME/public signed CA servers.
+	caRootCA = env.RegisterStringVar("CA_ROOT_CA", "",
+		"Explicitly set the root CA to expect for the CA connection.").Get()
+
+	outputKeyCertToDir = env.RegisterStringVar("OUTPUT_CERTS", "",
+		"The output directory for the key and certificate. If empty, key and certificate will not be saved. "+
+			"Must be set for VMs using provisioning certificates.").Get()
+	proxyConfigEnv = env.RegisterStringVar(
+		"PROXY_CONFIG",
+		"",
+		"The proxy configuration. This will be set by the injection - gateways will use file mounts.",
+	).Get()
+
+	caProviderEnv = env.RegisterStringVar("CA_PROVIDER", "Citadel", "name of authentication provider").Get()
+	// TODO: default to same as discovery address
+	caEndpointEnv = env.RegisterStringVar("CA_ADDR", "", "Address of the spiffee certificate provider. Defaults to discoveryAddress").Get()
+
+	// TODO: this is a horribly named env, it's really TOKEN_EXCHANGE_PLUGINS - but to avoid breaking
+	// it's left unchanged. It may not be needed because we autodetect.
+	pluginNamesEnv = env.RegisterStringVar("PLUGINS", "", "Token exchange plugins").Get()
+
+	// This is also disabled by presence of the SDS socket directory
+	enableGatewaySDSEnv = env.RegisterBoolVar("ENABLE_INGRESS_GATEWAY_SDS", false,
+		"Enable provisioning gateway secrets. Requires Secret read permission").Get()
+
+	// TODO: This is already present in ProxyConfig !!!
+	trustDomainEnv = env.RegisterStringVar("TRUST_DOMAIN", "",
+		"The trust domain for spiffe certificates").Get()
+
+	secretTTLEnv = env.RegisterDurationVar("SECRET_TTL", 24*time.Hour,
+		"The cert lifetime requested by istio agent").Get()
+
+	secretRotationGracePeriodRatioEnv = env.RegisterFloatVar("SECRET_GRACE_PERIOD_RATIO", 0.5,
+		"The grace period ratio for the cert rotation, by default 0.5.").Get()
+	secretRotationIntervalEnv = env.RegisterDurationVar("SECRET_ROTATION_CHECK_INTERVAL", 5*time.Minute,
+		"The ticker to detect and rotate the certificates, by default 5 minutes").Get()
+	staledConnectionRecycleIntervalEnv = env.RegisterDurationVar("STALED_CONNECTION_RECYCLE_RUN_INTERVAL", 5*time.Minute,
+		"The ticker to detect and close stale connections").Get()
+	initialBackoffInMilliSecEnv = env.RegisterIntVar("INITIAL_BACKOFF_MSEC", 0, "").Get()
+	pkcs8KeysEnv                = env.RegisterBoolVar("PKCS8_KEY", false,
+		"Whether to generate PKCS#8 private keys").Get()
+	eccSigAlgEnv        = env.RegisterStringVar("ECC_SIGNATURE_ALGORITHM", "", "The type of ECC signature algorithm to use when generating private keys").Get()
+	fileMountedCertsEnv = env.RegisterBoolVar("FILE_MOUNTED_CERTS", false, "").Get()
+	useTokenForCSREnv   = env.RegisterBoolVar("USE_TOKEN_FOR_CSR", false, "CSR requires a token").Get()
+	credFetcherTypeEnv  = env.RegisterStringVar("CREDENTIAL_FETCHER_TYPE", "",
+		"The type of the credential fetcher. Currently supported types include GoogleComputeEngine").Get()
+	skipParseTokenEnv = env.RegisterBoolVar("SKIP_PARSE_TOKEN", false,
+		"Skip Parse token to inspect information like expiration time in proxy. This may be possible "+
+			"for example in vm we don't use token to rotate cert.").Get()
+	proxyXDSViaAgent = env.RegisterStringVar("ISTIO_META_PROXY_XDS_VIA_AGENT", "",
+		"If set to enable or true or 1, envoy will proxy XDS calls via the agent instead of directly connecting to istiod. This option "+
+			"will be removed once the feature is stabilized.").Get()
+	// This is a copy of the env var in the init code.
+	dnsCaptureByAgent = env.RegisterStringVar("ISTIO_META_DNS_CAPTURE", "",
+		"If set, enable the capture of outgoing DNS packets on port 53, redirecting to istio-agent on :15053")
 
 	rootCmd = &cobra.Command{
-		Use:   "agent",
-		Short: "Istio Pilot agent",
-		Long:  "Istio Pilot provides management plane functionality to the Istio service mesh and Istio Mixer.",
+		Use:          "pilot-agent",
+		Short:        "Istio Pilot agent.",
+		Long:         "Istio Pilot agent runs in the sidecar or gateway container and bootstraps Envoy.",
+		SilenceUsage: true,
+		FParseErrWhitelist: cobra.FParseErrWhitelist{
+			// Allow unknown flags for backward-compatibility.
+			UnknownFlags: true,
+		},
 	}
 
 	proxyCmd = &cobra.Command{
 		Use:   "proxy",
 		Short: "Envoy proxy agent",
+		FParseErrWhitelist: cobra.FParseErrWhitelist{
+			// Allow unknown flags for backward-compatibility.
+			UnknownFlags: true,
+		},
 		RunE: func(c *cobra.Command, args []string) error {
-			glog.V(2).Infof("Version %s", version.Line())
-			role.Type = proxy.Sidecar
+			cmd.PrintFlags(c.Flags())
+			if err := log.Configure(loggingOptions); err != nil {
+				return err
+			}
+			grpclog.SetLoggerV2(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, ioutil.Discard))
+
+			// Extract pod variables.
+			podName := podNameVar.Get()
+			podNamespace := podNamespaceVar.Get()
+			podIP := net.ParseIP(instanceIPVar.Get()) // protobuf encoding of IP_ADDRESS type
+
+			log.Infof("Version %s", version.Info.String())
+			role.Type = model.SidecarProxy
 			if len(args) > 0 {
-				role.Type = proxy.NodeType(args[0])
+				role.Type = model.NodeType(args[0])
+				if !model.IsApplicationNodeType(role.Type) {
+					log.Errorf("Invalid role Type: %#v", role.Type)
+					return fmt.Errorf("Invalid role Type: " + string(role.Type))
+				}
 			}
 
-			// set values from registry platform
-			if role.IPAddress == "" {
-				if serviceregistry == platform.KubernetesRegistry {
-					role.IPAddress = os.Getenv("INSTANCE_IP")
-				} else {
-					ipAddr := "127.0.0.1"
-					if ok := proxy.WaitForPrivateNetwork(); ok {
-						ipAddr = proxy.GetPrivateIP().String()
-						glog.V(2).Infof("Obtained private IP %v", ipAddr)
+			if len(proxyIP) != 0 {
+				role.IPAddresses = []string{proxyIP}
+			} else if podIP != nil {
+				role.IPAddresses = []string{podIP.String()}
+			}
+
+			// Obtain all the IPs from the node
+			if ipAddrs, ok := network.GetPrivateIPs(context.Background()); ok {
+				log.Infof("Obtained private IP %v", ipAddrs)
+				if len(role.IPAddresses) == 1 {
+					for _, ip := range ipAddrs {
+						// prevent duplicate ips, the first one must be the pod ip
+						// as we pick the first ip as pod ip in istiod
+						if role.IPAddresses[0] != ip {
+							role.IPAddresses = append(role.IPAddresses, ip)
+						}
 					}
-
-					role.IPAddress = ipAddr
-				}
-			}
-			if role.ID == "" {
-				if serviceregistry == platform.KubernetesRegistry {
-					role.ID = os.Getenv("POD_NAME") + "." + os.Getenv("POD_NAMESPACE")
-				} else if serviceregistry == platform.ConsulRegistry {
-					role.ID = role.IPAddress + ".service.consul"
 				} else {
-					role.ID = role.IPAddress
-				}
-			}
-			pilotDomain := role.Domain
-			if role.Domain == "" {
-				if serviceregistry == platform.KubernetesRegistry {
-					role.Domain = os.Getenv("POD_NAMESPACE") + ".svc.cluster.local"
-					pilotDomain = "cluster.local"
-				} else if serviceregistry == platform.ConsulRegistry {
-					role.Domain = "service.consul"
-				} else {
-					role.Domain = ""
+					role.IPAddresses = append(role.IPAddresses, ipAddrs...)
 				}
 			}
 
-			// Get AZ for proxy
-			azResp, err := http.Get(fmt.Sprintf("http://%v/v1/az/%v/%v", discoveryAddress, serviceCluster, role.ServiceNode()))
+			// No IP addresses provided, append 127.0.0.1 for ipv4 and ::1 for ipv6
+			if len(role.IPAddresses) == 0 {
+				role.IPAddresses = append(role.IPAddresses, "127.0.0.1")
+				role.IPAddresses = append(role.IPAddresses, "::1")
+			}
+
+			// Check if proxy runs in ipv4 or ipv6 environment to set Envoy's
+			// operational parameters correctly.
+			proxyIPv6 := isIPv6Proxy(role.IPAddresses)
+			if len(role.ID) == 0 {
+				if registryID == serviceregistry.Kubernetes {
+					role.ID = podName + "." + podNamespace
+				} else {
+					role.ID = role.IPAddresses[0]
+				}
+			}
+
+			proxyConfig, err := constructProxyConfig()
 			if err != nil {
-				glog.V(2).Infof("Error retrieving availability zone from pilot: %v", err)
+				return fmt.Errorf("failed to get proxy config: %v", err)
+			}
+			if out, err := gogoprotomarshal.ToYAML(&proxyConfig); err != nil {
+				log.Infof("Failed to serialize to YAML: %v", err)
 			} else {
-				body, err := ioutil.ReadAll(azResp.Body)
-				if err != nil {
-					glog.V(2).Infof("Error reading availability zone response from pilot: %v", err)
-				}
-				availabilityZone = string(body)
-				glog.V(2).Infof("Proxy availability zone: %v", availabilityZone)
+				log.Infof("Effective config: %s", out)
 			}
 
-			glog.V(2).Infof("Proxy role: %#v", role)
+			// If not set, set a default based on platform - podNamespace.svc.cluster.local for
+			// K8S
+			role.DNSDomain = getDNSDomain(podNamespace, role.DNSDomain)
+			log.Infof("Proxy role: %#v", role)
 
-			proxyConfig := meshconfig.ProxyConfig{}
+			var jwtPath string
+			if jwtPolicy.Get() == jwt.PolicyThirdParty {
+				log.Info("JWT policy is third-party-jwt")
+				jwtPath = trustworthyJWTPath
+			} else if jwtPolicy.Get() == jwt.PolicyFirstParty {
+				log.Info("JWT policy is first-party-jwt")
+				jwtPath = securityModel.K8sSAJwtFileName
+			} else {
+				log.Info("Using existing certs")
+			}
 
-			// set all flags
-			proxyConfig.CustomConfigFile = customConfigFile
-			proxyConfig.ConfigPath = configPath
-			proxyConfig.BinaryPath = binaryPath
-			proxyConfig.ServiceCluster = serviceCluster
-			proxyConfig.AvailabilityZone = availabilityZone
-			proxyConfig.DrainDuration = ptypes.DurationProto(drainDuration)
-			proxyConfig.ParentShutdownDuration = ptypes.DurationProto(parentShutdownDuration)
-			proxyConfig.DiscoveryAddress = discoveryAddress
-			proxyConfig.DiscoveryRefreshDelay = ptypes.DurationProto(discoveryRefreshDelay)
-			proxyConfig.ZipkinAddress = zipkinAddress
-			proxyConfig.ConnectTimeout = ptypes.DurationProto(connectTimeout)
-			proxyConfig.StatsdUdpAddress = statsdUDPAddress
-			proxyConfig.ProxyAdminPort = int32(proxyAdminPort)
+			secOpts := &security.Options{
+				PilotCertProvider:  pilotCertProvider,
+				OutputKeyCertToDir: outputKeyCertToDir,
+				ProvCert:           provCert,
+				JWTPath:            jwtPath,
+				ClusterID:          clusterIDVar.Get(),
+				FileMountedCerts:   fileMountedCertsEnv,
+				CAEndpoint:         caEndpointEnv,
+				UseTokenForCSR:     useTokenForCSREnv,
+				CredFetcher:        nil,
+			}
+			// If not set explicitly, default to the discovery address.
+			if caEndpointEnv == "" {
+				secOpts.CAEndpoint = proxyConfig.DiscoveryAddress
+			}
+			secOpts.PluginNames = strings.Split(pluginNamesEnv, ",")
+
+			secOpts.EnableWorkloadSDS = true
+
+			secOpts.EnableGatewaySDS = enableGatewaySDSEnv
+			secOpts.CAProviderName = caProviderEnv
+
+			// TODO: extract from ProxyConfig
+			secOpts.TrustDomain = trustDomainEnv
+			secOpts.Pkcs8Keys = pkcs8KeysEnv
+			secOpts.ECCSigAlg = eccSigAlgEnv
+			secOpts.RecycleInterval = staledConnectionRecycleIntervalEnv
+			secOpts.ECCSigAlg = eccSigAlgEnv
+			secOpts.SecretTTL = secretTTLEnv
+			secOpts.SecretRotationGracePeriodRatio = secretRotationGracePeriodRatioEnv
+			secOpts.RotationInterval = secretRotationIntervalEnv
+			secOpts.InitialBackoffInMilliSec = int64(initialBackoffInMilliSecEnv)
+			// Disable the secret eviction for istio agent.
+			secOpts.EvictionDuration = 0
+			secOpts.SkipParseToken = skipParseTokenEnv
+
+			// TODO (liminw): CredFetcher is a general interface. In 1.7, we limit the use on GCE only because
+			// GCE is the only supported plugin at the moment.
+			if credFetcherTypeEnv == security.GCE {
+				credFetcher, err := credentialfetcher.NewCredFetcher(credFetcherTypeEnv, secOpts.TrustDomain, jwtPath)
+				if err != nil {
+					return fmt.Errorf("failed to create credential fetcher: %v", err)
+				}
+				log.Infof("Start credential fetcher of %s type in %s trust domain", credFetcherTypeEnv, secOpts.TrustDomain)
+				secOpts.CredFetcher = credFetcher
+			}
+
+			agentConfig := &istio_agent.AgentConfig{
+				XDSRootCerts: xdsRootCA,
+				CARootCerts:  caRootCA,
+			}
+			if proxyXDSViaAgent == "enable" || proxyXDSViaAgent == "true" || proxyXDSViaAgent == "1" {
+				agentConfig.ProxyXDSViaAgent = true
+				if dnsCaptureByAgent.Get() != "" {
+					agentConfig.DNSCapture = true
+				}
+				agentConfig.ProxyNamespace = podNamespace
+				agentConfig.ProxyDomain = role.DNSDomain
+			}
+			sa := istio_agent.NewAgent(&proxyConfig, agentConfig, secOpts)
 
 			var pilotSAN []string
-			switch controlPlaneAuthPolicy {
-			case meshconfig.AuthenticationPolicy_NONE.String():
-				proxyConfig.ControlPlaneAuthPolicy = meshconfig.AuthenticationPolicy_NONE
-			case meshconfig.AuthenticationPolicy_MUTUAL_TLS.String():
-				var ns string
-				proxyConfig.ControlPlaneAuthPolicy = meshconfig.AuthenticationPolicy_MUTUAL_TLS
-				if serviceregistry == platform.KubernetesRegistry {
-					partDiscoveryAddress := strings.Split(discoveryAddress, ":")
-					discoveryHostname := partDiscoveryAddress[0]
-					parts := strings.Split(discoveryHostname, ".")
-					if len(parts) == 1 {
-						// namespace of pilot is not part of discovery address use
-						// pod namespace e.g. istio-pilot:15003
-						ns = os.Getenv("POD_NAMESPACE")
-					} else {
-						// namespace is found in the discovery address
-						// e.g. istio-pilot.istio-system:15003
-						ns = parts[1]
-					}
-				}
-				pilotSAN = envoy.GetPilotSAN(pilotDomain, ns)
+			if proxyConfig.ControlPlaneAuthPolicy == meshconfig.AuthenticationPolicy_MUTUAL_TLS {
+				// Obtain Pilot SAN, using DNS.
+				pilotSAN = []string{getPilotSan(proxyConfig.DiscoveryAddress)}
+			}
+			log.Infof("PilotSAN %#v", pilotSAN)
+
+			// Start in process SDS.
+			_, err = sa.Start(role.Type == model.SidecarProxy, podNamespaceVar.Get())
+			if err != nil {
+				log.Fatala("Failed to start in-process SDS", err)
 			}
 
-			// resolve statsd address
-			if proxyConfig.StatsdUdpAddress != "" {
-				addr, err := proxy.ResolveAddr(proxyConfig.StatsdUdpAddress)
+			// If we are using a custom template file (for control plane proxy, for example), configure this.
+			if templateFile != "" && proxyConfig.CustomConfigFile == "" {
+				proxyConfig.ProxyBootstrapTemplatePath = templateFile
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			// If a status port was provided, start handling status probes.
+			if proxyConfig.StatusPort > 0 {
+				if err := initStatusServer(ctx, proxyIPv6, proxyConfig); err != nil {
+					return err
+				}
+			}
+
+			// If security token service (STS) port is not zero, start STS server and
+			// listen on STS port for STS requests. For STS, see
+			// https://tools.ietf.org/html/draft-ietf-oauth-token-exchange-16.
+			if stsPort > 0 {
+				localHostAddr := localHostIPv4
+				if proxyIPv6 {
+					localHostAddr = localHostIPv6
+				}
+				tokenManager := tokenmanager.CreateTokenManager(tokenManagerPlugin,
+					tokenmanager.Config{CredFetcher: secOpts.CredFetcher, TrustDomain: secOpts.TrustDomain})
+				stsServer, err := stsserver.NewServer(stsserver.Config{
+					LocalHostAddr: localHostAddr,
+					LocalPort:     stsPort,
+				}, tokenManager)
 				if err != nil {
 					return err
 				}
-
-				proxyConfig.StatsdUdpAddress = addr
+				defer stsServer.Stop()
 			}
 
-			if err := model.ValidateProxyConfig(&proxyConfig); err != nil {
-				return err
+			envoyProxy := envoy.NewProxy(envoy.ProxyConfig{
+				Config:              proxyConfig,
+				Node:                role.ServiceNode(),
+				LogLevel:            proxyLogLevel,
+				ComponentLogLevel:   proxyComponentLogLevel,
+				PilotSubjectAltName: pilotSAN,
+				NodeIPs:             role.IPAddresses,
+				STSPort:             stsPort,
+				OutlierLogPath:      outlierLogPath,
+				PilotCertProvider:   pilotCertProvider,
+				ProvCert:            sa.FindRootCAForXDS(),
+				Sidecar:             role.Type == model.SidecarProxy,
+				ProxyViaAgent:       agentConfig.ProxyXDSViaAgent,
+				CallCredentials:     callCredentials.Get(),
+			})
+
+			drainDuration, _ := types.DurationFromProto(proxyConfig.TerminationDrainDuration)
+			if ds, f := features.TerminationDrainDuration.Lookup(); f {
+				// Legacy environment variable is set, us that instead
+				drainDuration = time.Second * time.Duration(ds)
 			}
 
-			if out, err := model.ToYAML(&proxyConfig); err != nil {
-				glog.V(2).Infof("Failed to serialize to YAML: %v", err)
-			} else {
-				glog.V(2).Infof("Effective config: %s", out)
-			}
+			agent := envoy.NewAgent(envoyProxy, drainDuration)
 
-			certs := []envoy.CertSource{
-				{
-					Directory: proxy.AuthCertsPath,
-					Files:     []string{proxy.CertChainFilename, proxy.KeyFilename, proxy.RootCertFilename},
-				},
-			}
-
-			if role.Type == proxy.Ingress {
-				certs = append(certs, envoy.CertSource{
-					Directory: proxy.IngressCertsPath,
-					Files:     []string{proxy.IngressCertFilename, proxy.IngressKeyFilename},
-				})
-			}
-
-			glog.V(2).Infof("Monitored certs: %#v", certs)
-
-			envoyProxy := envoy.NewProxy(proxyConfig, role.ServiceNode(), proxyLogLevel)
-			agent := proxy.NewAgent(envoyProxy, proxy.DefaultRetry)
-			watcher := envoy.NewWatcher(proxyConfig, agent, role, certs, pilotSAN)
-			ctx, cancel := context.WithCancel(context.Background())
+			// Watcher is also kicking envoy start.
+			watcher := envoy.NewWatcher(agent.Restart)
 			go watcher.Run(ctx)
 
-			stop := make(chan struct{})
-			cmd.WaitSignal(stop)
-			<-stop
-			cancel()
-			return nil
+			// On SIGINT or SIGTERM, cancel the context, triggering a graceful shutdown
+			go cmd.WaitSignalFunc(cancel)
+
+			return agent.Run(ctx)
 		},
 	}
 )
 
-func timeDuration(dur *duration.Duration) time.Duration {
-	out, err := ptypes.Duration(dur)
-	if err != nil {
-		glog.Warning(err)
+func initStatusServer(ctx context.Context, proxyIPv6 bool, proxyConfig meshconfig.ProxyConfig) error {
+	localHostAddr := localHostIPv4
+	if proxyIPv6 {
+		localHostAddr = localHostIPv6
 	}
-	return out
+	prober := kubeAppProberNameVar.Get()
+	statusServer, err := status.NewServer(status.Config{
+		LocalHostAddr:  localHostAddr,
+		AdminPort:      uint16(proxyConfig.ProxyAdminPort),
+		StatusPort:     uint16(proxyConfig.StatusPort),
+		KubeAppProbers: prober,
+		NodeType:       role.Type,
+	})
+	if err != nil {
+		return err
+	}
+	go statusServer.Run(ctx)
+	return nil
+}
+
+func getDNSDomain(podNamespace, domain string) string {
+	if len(domain) == 0 {
+		if registryID == serviceregistry.Kubernetes {
+			domain = podNamespace + ".svc." + constants.DefaultKubernetesDomain
+		} else {
+			domain = ""
+		}
+	}
+	return domain
 }
 
 func init() {
-	proxyCmd.PersistentFlags().StringVar((*string)(&serviceregistry), "serviceregistry",
-		string(platform.KubernetesRegistry),
-		fmt.Sprintf("Select the platform for service registry, options are {%s, %s, %s}",
-			platform.KubernetesRegistry, platform.ConsulRegistry, platform.EurekaRegistry))
-	proxyCmd.PersistentFlags().StringVar(&role.IPAddress, "ip", "",
+	proxyCmd.PersistentFlags().StringVar((*string)(&registryID), "serviceregistry",
+		string(serviceregistry.Kubernetes),
+		fmt.Sprintf("Select the platform for service registry, options are {%s, %s}",
+			serviceregistry.Kubernetes, serviceregistry.Mock))
+	proxyCmd.PersistentFlags().StringVar(&proxyIP, "ip", "",
 		"Proxy IP address. If not provided uses ${INSTANCE_IP} environment variable.")
 	proxyCmd.PersistentFlags().StringVar(&role.ID, "id", "",
 		"Proxy unique ID. If not provided uses ${POD_NAME}.${POD_NAMESPACE} from environment variables")
-	proxyCmd.PersistentFlags().StringVar(&role.Domain, "domain", "",
+	proxyCmd.PersistentFlags().StringVar(&role.DNSDomain, "domain", "",
 		"DNS domain suffix. If not provided uses ${POD_NAMESPACE}.svc.cluster.local")
+	proxyCmd.PersistentFlags().StringVar(&trustDomain, "trust-domain", "",
+		"The domain to use for identities")
 
+	proxyCmd.PersistentFlags().StringVar(&meshConfigFile, "meshConfig", "./etc/istio/config/mesh",
+		"File name for Istio mesh configuration. If not specified, a default mesh will be used. This may be overridden by "+
+			"PROXY_CONFIG environment variable or proxy.istio.io/config annotation.")
+	proxyCmd.PersistentFlags().IntVar(&stsPort, "stsPort", 0,
+		"HTTP Port on which to serve Security Token Service (STS). If zero, STS service will not be provided.")
+	proxyCmd.PersistentFlags().StringVar(&tokenManagerPlugin, "tokenManagerPlugin", tokenmanager.GoogleTokenExchange,
+		"Token provider specific plugin name.")
 	// Flags for proxy configuration
-	values := proxy.DefaultProxyConfig()
-	proxyCmd.PersistentFlags().StringVar(&configPath, "configPath", values.ConfigPath,
-		"Path to the generated configuration file directory")
-	proxyCmd.PersistentFlags().StringVar(&binaryPath, "binaryPath", values.BinaryPath,
-		"Path to the proxy binary")
-	proxyCmd.PersistentFlags().StringVar(&serviceCluster, "serviceCluster", values.ServiceCluster,
-		"Service cluster")
-	proxyCmd.PersistentFlags().StringVar(&availabilityZone, "availabilityZone", values.AvailabilityZone,
-		"Availability zone")
-	proxyCmd.PersistentFlags().DurationVar(&drainDuration, "drainDuration",
-		timeDuration(values.DrainDuration),
-		"The time in seconds that Envoy will drain connections during a hot restart")
-	proxyCmd.PersistentFlags().DurationVar(&parentShutdownDuration, "parentShutdownDuration",
-		timeDuration(values.ParentShutdownDuration),
-		"The time in seconds that Envoy will wait before shutting down the parent process during a hot restart")
-	proxyCmd.PersistentFlags().StringVar(&discoveryAddress, "discoveryAddress", values.DiscoveryAddress,
-		"Address of the discovery service exposing xDS (e.g. istio-pilot:8080)")
-	proxyCmd.PersistentFlags().DurationVar(&discoveryRefreshDelay, "discoveryRefreshDelay",
-		timeDuration(values.DiscoveryRefreshDelay),
-		"Polling interval for service discovery (used by EDS, CDS, LDS, but not RDS)")
-	proxyCmd.PersistentFlags().StringVar(&zipkinAddress, "zipkinAddress", values.ZipkinAddress,
-		"Address of the Zipkin service (e.g. zipkin:9411)")
-	proxyCmd.PersistentFlags().DurationVar(&connectTimeout, "connectTimeout",
-		timeDuration(values.ConnectTimeout),
-		"Connection timeout used by Envoy for supporting services")
-	proxyCmd.PersistentFlags().StringVar(&statsdUDPAddress, "statsdUdpAddress", values.StatsdUdpAddress,
-		"IP Address and Port of a statsd UDP listener (e.g. 10.75.241.127:9125)")
-	proxyCmd.PersistentFlags().IntVar(&proxyAdminPort, "proxyAdminPort", int(values.ProxyAdminPort),
-		"Port on which Envoy should listen for administrative commands")
-	proxyCmd.PersistentFlags().StringVar(&controlPlaneAuthPolicy, "controlPlaneAuthPolicy",
-		values.ControlPlaneAuthPolicy.String(), "Control Plane Authentication Policy")
-	proxyCmd.PersistentFlags().StringVar(&customConfigFile, "customConfigFile", values.CustomConfigFile,
-		"Path to the generated configuration file directory")
+	proxyCmd.PersistentFlags().StringVar(&serviceCluster, "serviceCluster", constants.ServiceClusterName, "Service cluster")
 	// Log levels are provided by the library https://github.com/gabime/spdlog, used by Envoy.
-	proxyCmd.PersistentFlags().StringVar(&proxyLogLevel, "proxyLogLevel", "off",
+	proxyCmd.PersistentFlags().StringVar(&proxyLogLevel, "proxyLogLevel", "warning",
 		fmt.Sprintf("The log level used to start the Envoy proxy (choose from {%s, %s, %s, %s, %s, %s, %s})",
-			"trace", "debug", "info", "warn", "err", "critical", "off"))
+			"trace", "debug", "info", "warning", "error", "critical", "off"))
+	proxyCmd.PersistentFlags().IntVar(&concurrency, "concurrency", 0, "number of worker threads to run")
+	// See https://www.envoyproxy.io/docs/envoy/latest/operations/cli#cmdoption-component-log-level
+	proxyCmd.PersistentFlags().StringVar(&proxyComponentLogLevel, "proxyComponentLogLevel", "misc:error",
+		"The component log level used to start the Envoy proxy")
+	proxyCmd.PersistentFlags().StringVar(&templateFile, "templateFile", "",
+		"Go template bootstrap config")
+	proxyCmd.PersistentFlags().StringVar(&outlierLogPath, "outlierLogPath", "",
+		"The log path for outlier detection")
+
+	// Attach the Istio logging options to the command.
+	loggingOptions.AttachCobraFlags(rootCmd)
+
 	cmd.AddFlags(rootCmd)
 
 	rootCmd.AddCommand(proxyCmd)
-	rootCmd.AddCommand(cmd.VersionCmd)
+	rootCmd.AddCommand(version.CobraCommand())
+	rootCmd.AddCommand(iptables.GetCommand())
+	rootCmd.AddCommand(cleaniptables.GetCommand())
+
+	rootCmd.AddCommand(collateral.CobraCommand(rootCmd, &doc.GenManHeader{
+		Title:   "Istio Pilot Agent",
+		Section: "pilot-agent CLI",
+		Manual:  "Istio Pilot Agent",
+	}))
 }
 
+// TODO: get the config and bootstrap from istiod, by passing the env
+
+// Use env variables - from injection, k8s and local namespace config map.
+// No CLI parameters.
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		glog.Error(err)
+		log.Errora(err)
 		os.Exit(-1)
 	}
+}
+
+// isIPv6Proxy check the addresses slice and returns true for a valid IPv6 address
+// for all other cases it returns false
+func isIPv6Proxy(ipAddrs []string) bool {
+	for i := 0; i < len(ipAddrs); i++ {
+		addr := net.ParseIP(ipAddrs[i])
+		if addr == nil {
+			// Should not happen, invalid IP in proxy's IPAddresses slice should have been caught earlier,
+			// skip it to prevent a panic.
+			continue
+		}
+		if addr.To4() != nil {
+			return false
+		}
+	}
+	return true
 }

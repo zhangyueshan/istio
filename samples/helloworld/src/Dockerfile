@@ -1,4 +1,4 @@
-# Copyright 2017 Istio Authors
+# Copyright Istio Authors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 
 FROM python:2-onbuild
 
-RUN mkdir -p /opt/microservices
-ADD app.py /opt/microservices/
+WORKDIR /opt/microservices
+COPY app.py /opt/microservices/
 
 EXPOSE 5000
 
@@ -23,4 +23,4 @@ ARG service_version
 ENV SERVICE_VERSION ${service_version:-v1}
 
 WORKDIR /opt/microservices
-CMD python app.py
+CMD ["python", "app.py"]

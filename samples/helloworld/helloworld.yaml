@@ -5,19 +5,24 @@ metadata:
   labels:
     app: helloworld
 spec:
-  type: NodePort
   ports:
   - port: 5000
     name: http
   selector:
     app: helloworld
 ---
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: helloworld-v1
+  labels:
+    version: v1
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      app: helloworld
+      version: v1
   template:
     metadata:
       labels:
@@ -26,7 +31,7 @@ spec:
     spec:
       containers:
       - name: helloworld
-        image: istio/examples-helloworld-v1
+        image: docker.io/istio/examples-helloworld-v1
         resources:
           requests:
             cpu: "100m"
@@ -34,12 +39,18 @@ spec:
         ports:
         - containerPort: 5000
 ---
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: helloworld-v2
+  labels:
+    version: v2
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      app: helloworld
+      version: v2
   template:
     metadata:
       labels:
@@ -48,26 +59,10 @@ spec:
     spec:
       containers:
       - name: helloworld
-        image: istio/examples-helloworld-v2
+        image: docker.io/istio/examples-helloworld-v2
         resources:
           requests:
             cpu: "100m"
         imagePullPolicy: IfNotPresent #Always
         ports:
         - containerPort: 5000
----
-apiVersion: extensions/v1beta1
-kind: Ingress
-metadata:
-  name: helloworld
-  annotations:
-    kubernetes.io/ingress.class: "istio"
-spec:
-  rules:
-  - http:
-      paths:
-      - path: /hello
-        backend:
-          serviceName: helloworld
-          servicePort: 5000
----
